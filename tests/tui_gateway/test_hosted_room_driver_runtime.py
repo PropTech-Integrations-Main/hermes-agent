@@ -2067,6 +2067,44 @@ def test_authority_loss_stops_terminal_commit(db: Path):
     assert "authority changed" in runtime.status()["last_error"]
 
 
+def test_busy_profile_requeues_after_the_lease_ttl_and_then_settles(db: Path):
+    """A lock wait longer than the lease must not fence the turn as indeterminate."""
+    from tools.bot_relay import TurnBusyError
+
+    identity = _identity()
+    _admit(db, identity)
+
+    class BusyThenFree:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        @contextmanager
+        def __call__(self, profile: str):
+            self.calls += 1
+            if self.calls == 1:
+                time.sleep(1.0)
+                raise TurnBusyError(profile, 1.0)
+            yield
+
+    rpc = FakeSessionRPC()
+    runtime = _runtime(
+        db,
+        rpc,
+        BusyThenFree(),
+        lease_ttl_seconds=0.4,
+        unavailable_retry_min_seconds=0.05,
+        unavailable_retry_max_seconds=0.05,
+    )
+
+    runtime.start()
+    _wait_for(lambda: state.get_task(db, identity)["status"] == "settled")
+    assert runtime.stop(timeout=5.0)
+
+    assert [method for method, _params in rpc.calls].count("submit") == 1
+    assert state.get_task(db, identity)["status"] == "settled"
+    assert "profile busy" in (runtime.status()["last_error"] or "")
+
+
 def test_profile_turn_lock_covers_resolve_submit_and_terminal_observation(db: Path):
     identity = _identity()
     _admit(db, identity)

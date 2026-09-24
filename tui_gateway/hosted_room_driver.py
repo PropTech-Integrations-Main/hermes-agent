@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, ContextManager, Protocol, cast
@@ -575,6 +575,42 @@ class HostedRoomRuntime:
                 state.release_lease(self.db_path, lease, clock=self.clock)
                 self._drop_lease(room_id)
 
+    @contextmanager
+    def _lease_keepalive(self, lease: state.DriverLease):
+        """Renew ``lease`` while this attempt waits. The profile lock wait is longer than the TTL."""
+        stop = threading.Event()
+        interval = max(0.05, self.lease_ttl_seconds / 3)
+
+        def beat() -> None:
+            while not stop.wait(interval):
+                try:
+                    self._renew_lease_if_needed(lease, force=True)
+                except state.DriverStateError:
+                    return
+
+        thread = threading.Thread(
+            target=beat, name=f"hosted-room-lease-{lease.room_id[:12]}", daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join(timeout=1.0)
+
+    def _requeue_unsubmitted(
+        self, binding: HostedRoomBinding, task: Mapping[str, Any], attempt: state.TaskAttempt,
+        exc: Exception,
+    ) -> None:
+        """Put a turn that never reached ``submit`` back on the queue."""
+        try:
+            state.requeue_not_admitted_task(self.db_path, attempt, clock=self.clock)
+        except (state.StaleLeaseError, state.StaleTaskError) as fence_exc:
+            self._mark_ambiguous(binding, attempt)
+            self._record_task_error(attempt, f"busy profile lost its fence: {fence_exc}")
+            return
+        delay = self._defer_unavailable_route(task)
+        self._record_task_error(attempt, f"profile busy; queued for retry in {delay:g}s ({exc})")
+
     # ------------------------------------------------------------------ attempt execution
     def _execute_attempt(
         self, binding: HostedRoomBinding, task: Mapping[str, Any], attempt: state.TaskAttempt
@@ -584,7 +620,7 @@ class HostedRoomRuntime:
         with self._status_lock:
             self._current_tasks[binding.room_id] = attempt.identity
         try:
-            with self.turn_lock(profile):
+            with self._lease_keepalive(attempt.lease), self.turn_lock(profile):
                 session = self._resolve_or_create(transport, profile, binding.room_id)
                 # A submit should fail before admission or return after it; an unexpected
                 # exception at that boundary is ambiguous, never a proven failure.
@@ -607,7 +643,12 @@ class HostedRoomRuntime:
             self._drop_lease(binding.room_id)
             self._record_task_error(attempt, f"fenced: {exc}")
         except Exception as exc:
-            if submit_attempted and bool(getattr(exc, "not_admitted", False)):
+            from tools.bot_relay import TurnBusyError
+            if isinstance(exc, TurnBusyError) and not submit_attempted:
+                # The lock wait can outlast the lease. Keepalive makes requeue possible;
+                # this turn never reached submit, so it is not an indeterminate attempt.
+                self._requeue_unsubmitted(binding, task, attempt, exc)
+            elif submit_attempted and bool(getattr(exc, "not_admitted", False)):
                 try:
                     state.requeue_not_admitted_task(self.db_path, attempt, clock=self.clock)
                 except (state.StaleLeaseError, state.StaleTaskError) as fence_exc:
